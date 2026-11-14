@@ -10,6 +10,11 @@ const CACHE_TTL_MS = 20 * 60 * 1000;
 const MAX_CACHE_SIZE = 400;
 const memoryCache = new Map();
 
+const IMDB_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const IMDB_NULL_CACHE_TTL_MS = 30 * 60 * 1000;
+const MAX_IMDB_CACHE_SIZE = 2000;
+const imdbCache = new Map();
+
 const MOVIE_GENRES = {
   28: 'Hành Động',
   12: 'Phiêu Lưu',
@@ -78,7 +83,7 @@ const MOVIE_GENRE_NAME_TO_ID = Object.fromEntries(
 
 const MANIFEST = {
   id: 'community.nothingp.tmdb.vi',
-  version: '1.0.0',
+  version: '1.1.0',
   name: 'NothingP • TMDB Tiếng Việt',
   description:
     'Danh mục & Metadata phim từ TMDB với ngôn ngữ Tiếng Việt (vi-VN) cho Stremio & Nuvio: Phim Mới Có Bản Phát Hành (Digital Release), Trending Today Phim Lẻ, Trending Today Phim Bộ.',
@@ -89,11 +94,11 @@ const MANIFEST = {
     {
       name: 'meta',
       types: ['movie', 'series'],
-      idPrefixes: ['tmdb:', 'tt']
+      idPrefixes: ['tt', 'tmdb:']
     }
   ],
   types: ['movie', 'series'],
-  idPrefixes: ['tmdb:', 'tt'],
+  idPrefixes: ['tt', 'tmdb:'],
   catalogs: [
     {
       type: 'movie',
@@ -252,7 +257,41 @@ function mapGenres(genreIds, type) {
   return genreIds.map((id) => table[id]).filter(Boolean);
 }
 
-function mapCatalogItem(item, type) {
+async function resolveImdbIdForTmdb(tmdbId, type, apiKey) {
+  const mediaType = type === 'series' ? 'tv' : 'movie';
+  const cacheKey = `${mediaType}:${tmdbId}`;
+  const cached = imdbCache.get(cacheKey);
+  if (cached && Date.now() <= cached.expiresAt) {
+    return cached.value;
+  }
+  if (cached) {
+    imdbCache.delete(cacheKey);
+  }
+
+  try {
+    const data = await tmdbFetch(`/${mediaType}/${tmdbId}/external_ids`, {}, apiKey);
+    const imdbId =
+      typeof data?.imdb_id === 'string' && /^tt\d+$/i.test(data.imdb_id.trim())
+        ? data.imdb_id.trim()
+        : null;
+
+    if (imdbCache.size >= MAX_IMDB_CACHE_SIZE) {
+      const oldestKey = imdbCache.keys().next().value;
+      if (oldestKey !== undefined) {
+        imdbCache.delete(oldestKey);
+      }
+    }
+    imdbCache.set(cacheKey, {
+      value: imdbId,
+      expiresAt: Date.now() + (imdbId ? IMDB_CACHE_TTL_MS : IMDB_NULL_CACHE_TTL_MS)
+    });
+    return imdbId;
+  } catch {
+    return null;
+  }
+}
+
+function mapCatalogItem(item, type, imdbId = null) {
   const mediaType = type === 'series' ? 'series' : 'movie';
   const rawDate = item.release_date || item.first_air_date || '';
   const name =
@@ -263,7 +302,7 @@ function mapCatalogItem(item, type) {
     `TMDB #${item.id}`;
 
   const preview = {
-    id: `tmdb:${item.id}`,
+    id: imdbId || `tmdb:${item.id}`,
     tmdbId: item.id,
     type: mediaType,
     name,
@@ -276,6 +315,7 @@ function mapCatalogItem(item, type) {
     genres: mapGenres(item.genre_ids, mediaType)
   };
 
+  if (imdbId) preview.imdb_id = imdbId;
   const released = toIsoDate(rawDate);
   if (released) preview.released = released;
   if (item.vote_average > 0) {
@@ -361,7 +401,10 @@ async function getCatalog(type, catalogId, extra, apiKey) {
   }
 
   const results = Array.isArray(data?.results) ? data.results : [];
-  return results.map((item) => mapCatalogItem(item, type));
+  const imdbIds = await Promise.all(
+    results.map((item) => resolveImdbIdForTmdb(item.id, type, apiKey))
+  );
+  return results.map((item, idx) => mapCatalogItem(item, type, imdbIds[idx]));
 }
 
 function selectClearLogo(logos) {
@@ -495,7 +538,9 @@ async function getMeta(type, id, apiKey) {
     viData.runtime ||
     (Array.isArray(viData.episode_run_time) ? viData.episode_run_time[0] : null);
 
-  const metaId = id.startsWith('tmdb:') || id.startsWith('tt') ? id : `tmdb:${tmdbId}`;
+  const metaId = /^(tmdb:|tt)/i.test(id)
+    ? id
+    : imdbId || `tmdb:${tmdbId}`;
 
   const meta = {
     id: metaId,
