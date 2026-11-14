@@ -12,7 +12,13 @@ const server = http.createServer(async (req, res) => {
       method: req.method,
       headers: req.headers
     });
-    const response = await worker.fetch(request, process.env || {});
+    const backgroundTasks = [];
+    const ctx = {
+      waitUntil(promise) {
+        backgroundTasks.push(Promise.resolve(promise).catch(() => {}));
+      }
+    };
+    const response = await worker.fetch(request, process.env || {}, ctx);
     res.statusCode = response.status;
     for (const [key, value] of response.headers.entries()) {
       res.setHeader(key, value);

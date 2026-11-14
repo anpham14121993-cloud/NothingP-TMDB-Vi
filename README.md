@@ -32,7 +32,8 @@ Addon Catalog & Metadata dành cho **Stremio** và **Nuvio**, lấy dữ liệu 
 
 - Hỗ trợ cả ID dạng `tmdb:<id>` và IMDb `tt<id>`.
 - Tự động trả về `imdb_id` và `behaviorHints.defaultVideoId` để tương thích với các Addon nguồn phát (Torrentio, Nuvio Streams, Xem20, Fiml4K, PhimLongTieng...).
-- Hiển thị đầy đủ Poster, Backdrop HD, ClearLogo (`vi`/`en`), Thể loại tiếng Việt, Diễn viên, Đạo diễn, Biên kịch, Trailer YouTube và danh sách Tập phim (Seasons & Episodes) cho phim bộ.
+- Tối ưu tốc độ tải Meta nhờ Edge Cache đa tầng (`caches.default`), đồng bộ snapshot `imdb <-> tmdb`, rút gọn `append_to_response` khi đã có sẵn mô tả tiếng Việt, và pre-warm danh sách phim đầu trang.
+- Hiển thị đầy đủ Poster, Backdrop HD, ClearLogo (`vi`/`en`), Thể loại tiếng Việt, Diễn viên, Đạo diễn, Biên kịch, Trailer YouTube và danh sách Tập phim (Seasons & Episodes, tối đa 8 mùa) cho phim bộ.
 
 ---
 

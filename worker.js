@@ -5,6 +5,8 @@ const TMDB_API_BASES = [
   'https://api.tmdb.org/3'
 ];
 const TMDB_IMG_BASE = 'https://image.tmdb.org/t/p';
+const EDGE_CACHE_ORIGIN = 'https://cache.tmdbvi.internal';
+const IDMAP_EDGE_PATH = '/idmap-v3/latest';
 
 const CACHE_TTL_MS = 20 * 60 * 1000;
 const MAX_CACHE_SIZE = 400;
@@ -15,6 +17,10 @@ const IMDB_NULL_CACHE_TTL_MS = 30 * 60 * 1000;
 const MAX_IMDB_CACHE_SIZE = 2000;
 const imdbCache = new Map();
 const imdbToTmdbCache = new Map();
+
+const SEED_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const MAX_SEED_CACHE_SIZE = 1000;
+const seedCache = new Map();
 
 const META_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const MAX_META_CACHE_SIZE = 500;
@@ -88,7 +94,7 @@ const MOVIE_GENRE_NAME_TO_ID = Object.fromEntries(
 
 const MANIFEST = {
   id: 'community.nothingp.tmdb.vi',
-  version: '1.2.0',
+  version: '1.3.0',
   name: 'NothingP • TMDB Tiếng Việt',
   description:
     'Danh mục & Metadata phim từ TMDB với ngôn ngữ Tiếng Việt (vi-VN) cho Stremio & Nuvio: Phim Mới Có Bản Phát Hành (Digital Release), Trending Today Phim Lẻ, Trending Today Phim Bộ.',
@@ -199,11 +205,52 @@ function buildKeyCandidates(primaryKey) {
   return keys;
 }
 
-async function readEdgeCache(cachePath) {
+function createRunContext(rawCtx, maxSubrequests = 46) {
+  let usedOps = 0;
+  let hydratedThisRequest = false;
+  return {
+    waitUntil(promise) {
+      if (rawCtx && typeof rawCtx.waitUntil === 'function') {
+        rawCtx.waitUntil(Promise.resolve(promise).catch(() => {}));
+      }
+    },
+    canSpend(count = 1) {
+      return usedOps + count <= maxSubrequests;
+    },
+    spend(count = 1) {
+      usedOps += count;
+      return usedOps;
+    },
+    remaining() {
+      return Math.max(0, maxSubrequests - usedOps);
+    },
+    wasHydrated() {
+      return hydratedThisRequest;
+    },
+    markHydrated() {
+      hydratedThisRequest = true;
+    }
+  };
+}
+
+function normalizeStremioType(type) {
+  return type === 'series' ? 'series' : 'movie';
+}
+
+function buildEdgeCacheRequest(cachePathOrUrl) {
+  const url = /^https?:\/\//i.test(cachePathOrUrl)
+    ? cachePathOrUrl
+    : `${EDGE_CACHE_ORIGIN}${cachePathOrUrl.startsWith('/') ? cachePathOrUrl : `/${cachePathOrUrl}`}`;
+  return new Request(url, { method: 'GET' });
+}
+
+async function readEdgeCache(cachePathOrUrl, ctx = null) {
   try {
     const cache = typeof caches !== 'undefined' ? caches.default : null;
     if (!cache) return null;
-    const hit = await cache.match(`https://tmdb-vi-cache.internal${cachePath}`);
+    if (ctx && typeof ctx.canSpend === 'function' && !ctx.canSpend(1)) return null;
+    ctx?.spend?.(1);
+    const hit = await cache.match(buildEdgeCacheRequest(cachePathOrUrl));
     if (!hit) return null;
     return await hit.json();
   } catch {
@@ -211,25 +258,42 @@ async function readEdgeCache(cachePath) {
   }
 }
 
-function writeEdgeCache(cachePath, data, maxAgeSec, ctx) {
+function writeEdgeCache(cachePathOrUrl, data, maxAgeSec, ctx = null) {
   try {
     const cache = typeof caches !== 'undefined' ? caches.default : null;
-    if (!cache) return;
+    if (!cache) return Promise.resolve(false);
+    if (ctx && typeof ctx.canSpend === 'function' && !ctx.canSpend(1)) {
+      return Promise.resolve(false);
+    }
+    ctx?.spend?.(1);
     const res = new Response(JSON.stringify(data), {
+      status: 200,
       headers: {
         'Content-Type': 'application/json; charset=utf-8',
-        'Cache-Control': `public, max-age=${maxAgeSec}`
+        'Cache-Control': `public, max-age=${maxAgeSec}, s-maxage=${maxAgeSec}`
       }
     });
     const promise = cache
-      .put(`https://tmdb-vi-cache.internal${cachePath}`, res)
-      .catch(() => {});
+      .put(buildEdgeCacheRequest(cachePathOrUrl), res)
+      .then(() => true)
+      .catch(() => false);
     if (ctx && typeof ctx.waitUntil === 'function') {
       ctx.waitUntil(promise);
     }
+    return promise;
   } catch {
-    // ignore edge cache errors
+    return Promise.resolve(false);
   }
+}
+
+function setBoundedMap(map, key, value, maxSize) {
+  if (map.has(key)) {
+    map.delete(key);
+  } else if (map.size >= maxSize) {
+    const oldestKey = map.keys().next().value;
+    if (oldestKey !== undefined) map.delete(oldestKey);
+  }
+  map.set(key, value);
 }
 
 function rememberIdMapping(mediaType, tmdbId, imdbId) {
@@ -239,16 +303,133 @@ function rememberIdMapping(mediaType, tmdbId, imdbId) {
   if (!/^tt\d+$/i.test(cleanImdb) || !/^\d+$/.test(cleanTmdb)) return;
 
   for (const key of [`${mediaType}:${cleanImdb}`, cleanImdb]) {
-    if (imdbToTmdbCache.size >= MAX_IMDB_CACHE_SIZE) {
-      const oldestKey = imdbToTmdbCache.keys().next().value;
-      if (oldestKey !== undefined) imdbToTmdbCache.delete(oldestKey);
+    setBoundedMap(imdbToTmdbCache, key, cleanTmdb, MAX_IMDB_CACHE_SIZE);
+  }
+  setBoundedMap(
+    imdbCache,
+    `${mediaType}:${cleanTmdb}`,
+    {
+      value: cleanImdb,
+      expiresAt: Date.now() + IMDB_CACHE_TTL_MS
+    },
+    MAX_IMDB_CACHE_SIZE
+  );
+}
+
+function getImdbFromMemory(mediaType, tmdbId) {
+  const entry = imdbCache.get(`${mediaType}:${tmdbId}`);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    imdbCache.delete(`${mediaType}:${tmdbId}`);
+    return null;
+  }
+  return entry.value;
+}
+
+function getSeed(type, tmdbId) {
+  const mediaType = normalizeStremioType(type);
+  const key = `${mediaType}:${tmdbId}`;
+  const entry = seedCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    seedCache.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function setSeed(type, tmdbId, seed) {
+  if (!tmdbId || !seed) return;
+  const mediaType = normalizeStremioType(type);
+  const compact = {
+    tmdbId: Number(seed.tmdbId || tmdbId),
+    type: mediaType,
+    name: seed.name || '',
+    description: seed.description || '',
+    poster: seed.poster || null,
+    background: seed.background || null,
+    releaseInfo: seed.releaseInfo,
+    imdbRating: seed.imdbRating,
+    genres: Array.isArray(seed.genres) ? seed.genres : []
+  };
+  if (seed.imdb_id) compact.imdb_id = seed.imdb_id;
+  setBoundedMap(
+    seedCache,
+    `${mediaType}:${tmdbId}`,
+    {
+      value: compact,
+      expiresAt: Date.now() + SEED_CACHE_TTL_MS
+    },
+    MAX_SEED_CACHE_SIZE
+  );
+}
+
+async function hydrateIdMapFromEdge(ctx = null) {
+  if (ctx?.wasHydrated?.()) return;
+  ctx?.markHydrated?.();
+  const snap = await readEdgeCache(IDMAP_EDGE_PATH, ctx);
+  if (!snap || typeof snap !== 'object') return;
+
+  if (snap.imdbToTmdb && typeof snap.imdbToTmdb === 'object') {
+    for (const [k, tmdbId] of Object.entries(snap.imdbToTmdb)) {
+      if (!tmdbId) continue;
+      setBoundedMap(imdbToTmdbCache, k, String(tmdbId), MAX_IMDB_CACHE_SIZE);
+      const colonIdx = k.indexOf(':');
+      if (colonIdx > 0) {
+        const epType = k.slice(0, colonIdx);
+        const imdb = k.slice(colonIdx + 1);
+        if (!imdbCache.has(`${epType}:${tmdbId}`)) {
+          setBoundedMap(
+            imdbCache,
+            `${epType}:${tmdbId}`,
+            { value: imdb, expiresAt: Date.now() + IMDB_CACHE_TTL_MS },
+            MAX_IMDB_CACHE_SIZE
+          );
+        }
+      }
     }
-    imdbToTmdbCache.set(key, cleanTmdb);
+  }
+
+  if (snap.seeds && typeof snap.seeds === 'object') {
+    const now = Date.now();
+    for (const [key, seed] of Object.entries(snap.seeds)) {
+      if (!seed || !seed.tmdbId) continue;
+      if (!seedCache.has(key)) {
+        setBoundedMap(
+          seedCache,
+          key,
+          { value: seed, expiresAt: now + SEED_CACHE_TTL_MS },
+          MAX_SEED_CACHE_SIZE
+        );
+      }
+      if (seed.imdb_id) {
+        const epType = seed.type === 'series' ? 'tv' : 'movie';
+        rememberIdMapping(epType, String(seed.tmdbId), seed.imdb_id);
+      }
+    }
   }
 }
 
-function getCachedMeta(mediaType, tmdbId) {
-  const key = `${mediaType}:${tmdbId}`;
+function saveIdMapSnapshot(ctx = null) {
+  const idEntries = Array.from(imdbToTmdbCache.entries()).slice(-300);
+  const now = Date.now();
+  const seedEntries = [];
+  for (const [k, entry] of seedCache.entries()) {
+    if (entry && entry.expiresAt > now) {
+      seedEntries.push([k, entry.value]);
+    }
+  }
+  const compactSeeds = Object.fromEntries(seedEntries.slice(-150));
+  const payload = {
+    updatedAt: now,
+    imdbToTmdb: Object.fromEntries(idEntries),
+    seeds: compactSeeds
+  };
+  return writeEdgeCache(IDMAP_EDGE_PATH, payload, 21600, ctx);
+}
+
+function getCachedMeta(mediaType, keyPart) {
+  const key = `${mediaType}:${String(keyPart).toLowerCase()}`;
   const entry = metaCache.get(key);
   if (!entry) return null;
   if (Date.now() > entry.expiresAt) {
@@ -258,16 +439,18 @@ function getCachedMeta(mediaType, tmdbId) {
   return entry.value;
 }
 
-function setCachedMeta(mediaType, tmdbId, meta) {
-  const key = `${mediaType}:${tmdbId}`;
-  if (metaCache.size >= MAX_META_CACHE_SIZE) {
-    const oldestKey = metaCache.keys().next().value;
-    if (oldestKey !== undefined) metaCache.delete(oldestKey);
-  }
-  metaCache.set(key, {
-    value: meta,
-    expiresAt: Date.now() + META_CACHE_TTL_MS
-  });
+function setCachedMeta(mediaType, keyPart, meta) {
+  if (!keyPart || !meta) return;
+  const key = `${mediaType}:${String(keyPart).toLowerCase()}`;
+  setBoundedMap(
+    metaCache,
+    key,
+    {
+      value: meta,
+      expiresAt: Date.now() + META_CACHE_TTL_MS
+    },
+    MAX_META_CACHE_SIZE
+  );
 }
 
 async function tmdbFetch(path, params = {}, primaryKey = DEFAULT_PRIMARY_KEY, ctx = null) {
@@ -282,12 +465,6 @@ async function tmdbFetch(path, params = {}, primaryKey = DEFAULT_PRIMARY_KEY, ct
   const cached = getCache(cacheKey);
   if (cached) return cached;
 
-  const edgeCached = await readEdgeCache(`/tmdb${cacheKey}`);
-  if (edgeCached) {
-    setCache(cacheKey, edgeCached);
-    return edgeCached;
-  }
-
   const keys = buildKeyCandidates(primaryKey);
   let lastError = null;
 
@@ -296,10 +473,11 @@ async function tmdbFetch(path, params = {}, primaryKey = DEFAULT_PRIMARY_KEY, ct
       const sep = queryStr ? '&' : '';
       const url = `${base}${cleanPath}?${queryStr}${sep}api_key=${encodeURIComponent(key)}`;
       try {
+        ctx?.spend?.(1);
         const res = await fetch(url, {
           headers: {
             Accept: 'application/json',
-            'User-Agent': 'NothingP-TMDB-Vi/1.2'
+            'User-Agent': 'NothingP-TMDB-Vi/1.3'
           },
           cf: {
             cacheTtl: 3600,
@@ -309,7 +487,6 @@ async function tmdbFetch(path, params = {}, primaryKey = DEFAULT_PRIMARY_KEY, ct
         if (res.ok) {
           const data = await res.json();
           setCache(cacheKey, data);
-          writeEdgeCache(`/tmdb${cacheKey}`, data, 3600, ctx);
           return data;
         }
         lastError = new Error(`TMDB HTTP ${res.status} on ${base}${cleanPath}`);
@@ -359,16 +536,15 @@ async function resolveImdbIdForTmdb(tmdbId, type, apiKey, ctx = null) {
         ? data.imdb_id.trim()
         : null;
 
-    if (imdbCache.size >= MAX_IMDB_CACHE_SIZE) {
-      const oldestKey = imdbCache.keys().next().value;
-      if (oldestKey !== undefined) {
-        imdbCache.delete(oldestKey);
-      }
-    }
-    imdbCache.set(cacheKey, {
-      value: imdbId,
-      expiresAt: Date.now() + (imdbId ? IMDB_CACHE_TTL_MS : IMDB_NULL_CACHE_TTL_MS)
-    });
+    setBoundedMap(
+      imdbCache,
+      cacheKey,
+      {
+        value: imdbId,
+        expiresAt: Date.now() + (imdbId ? IMDB_CACHE_TTL_MS : IMDB_NULL_CACHE_TTL_MS)
+      },
+      MAX_IMDB_CACHE_SIZE
+    );
     if (imdbId) {
       rememberIdMapping(mediaType, tmdbId, imdbId);
     }
@@ -491,10 +667,21 @@ async function getCatalog(type, catalogId, extra, apiKey, ctx = null) {
   }
 
   const results = Array.isArray(data?.results) ? data.results : [];
+  if (results.length > 0) {
+    await hydrateIdMapFromEdge(ctx);
+  }
   const imdbIds = await Promise.all(
     results.map((item) => resolveImdbIdForTmdb(item.id, type, apiKey, ctx))
   );
-  return results.map((item, idx) => mapCatalogItem(item, type, imdbIds[idx]));
+  const metas = results.map((item, idx) => {
+    const mapped = mapCatalogItem(item, type, imdbIds[idx]);
+    setSeed(mapped.type, String(item.id), mapped);
+    return mapped;
+  });
+  if (metas.length > 0) {
+    await saveIdMapSnapshot(ctx);
+  }
+  return metas;
 }
 
 function selectClearLogo(logos) {
@@ -519,61 +706,133 @@ async function resolveTmdbId(rawId, type, apiKey, ctx = null) {
   if (/^tt\d+/i.test(cleaned)) {
     const imdbId = cleaned.split(':')[0].toLowerCase();
     const mediaEndpointType = type === 'series' ? 'tv' : 'movie';
-    const mapped =
+    let mapped =
+      imdbToTmdbCache.get(`${mediaEndpointType}:${imdbId}`) ||
+      imdbToTmdbCache.get(imdbId);
+    if (mapped) return mapped;
+
+    await hydrateIdMapFromEdge(ctx);
+    mapped =
       imdbToTmdbCache.get(`${mediaEndpointType}:${imdbId}`) ||
       imdbToTmdbCache.get(imdbId);
     if (mapped) return mapped;
 
     const found = await tmdbFetch(
       `/find/${encodeURIComponent(imdbId)}`,
-      { external_source: 'imdb_id' },
+      { external_source: 'imdb_id', language: 'vi-VN' },
       apiKey,
       ctx
     );
     if (!found) return null;
+
     if (type === 'series') {
-      const tvId = found.tv_results?.[0]?.id || found.movie_results?.[0]?.id;
-      if (tvId) {
-        rememberIdMapping('tv', String(tvId), imdbId);
-        return String(tvId);
+      const matched = found.tv_results?.[0] || found.movie_results?.[0];
+      if (matched?.id) {
+        const matchedEndpoint = found.tv_results?.[0] ? 'tv' : 'movie';
+        const matchedStremio = matchedEndpoint === 'tv' ? 'series' : 'movie';
+        rememberIdMapping(matchedEndpoint, String(matched.id), imdbId);
+        setSeed(matchedStremio, String(matched.id), mapCatalogItem(matched, matchedStremio, imdbId));
+        return String(matched.id);
       }
       return null;
     }
-    const movieId = found.movie_results?.[0]?.id || found.tv_results?.[0]?.id;
-    if (movieId) {
-      rememberIdMapping('movie', String(movieId), imdbId);
-      return String(movieId);
+
+    const matched = found.movie_results?.[0] || found.tv_results?.[0];
+    if (matched?.id) {
+      const matchedEndpoint = found.movie_results?.[0] ? 'movie' : 'tv';
+      const matchedStremio = matchedEndpoint === 'tv' ? 'series' : 'movie';
+      rememberIdMapping(matchedEndpoint, String(matched.id), imdbId);
+      setSeed(matchedStremio, String(matched.id), mapCatalogItem(matched, matchedStremio, imdbId));
+      return String(matched.id);
     }
     return null;
   }
   return null;
 }
 
-async function getMeta(type, id, apiKey, ctx = null) {
-  const mediaType = type === 'series' ? 'series' : 'movie';
+function parseDirectCacheKey(rawId) {
+  const cleaned = String(rawId || '').trim();
+  if (/^tmdb:(\d+)/i.test(cleaned)) {
+    const num = cleaned.slice(5).split(':')[0].trim();
+    return /^\d+$/.test(num) ? { key: num, tmdbId: num } : { key: null, tmdbId: null };
+  }
+  if (/^\d+$/.test(cleaned)) {
+    return { key: cleaned, tmdbId: cleaned };
+  }
+  if (/^tt\d+/i.test(cleaned)) {
+    return { key: cleaned.split(':')[0].toLowerCase(), tmdbId: null };
+  }
+  return { key: null, tmdbId: null };
+}
+
+function syncCacheAliases(mediaType, tmdbEndpointType, meta) {
+  if (!meta) return;
+  const canonicalId = meta.imdb_id || `tmdb:${meta.tmdbId}`;
+  const storedBase = { ...meta, id: canonicalId };
+  setCachedMeta(mediaType, String(meta.tmdbId), storedBase);
+  if (meta.imdb_id) {
+    rememberIdMapping(tmdbEndpointType, String(meta.tmdbId), meta.imdb_id);
+    setCachedMeta(mediaType, meta.imdb_id.toLowerCase(), { ...meta, id: meta.imdb_id });
+  }
+}
+
+async function getMeta(type, id, apiKey, ctx = null, options = {}) {
+  const mediaType = normalizeStremioType(type);
   const tmdbEndpointType = mediaType === 'series' ? 'tv' : 'movie';
-  const tmdbId = await resolveTmdbId(id, mediaType, apiKey, ctx);
+  const requestedMetaId = /^(tmdb:|tt)/i.test(id) ? id : null;
+  const { key: directKey, tmdbId: directTmdbId } = parseDirectCacheKey(id);
+
+  if (directKey) {
+    const memDirect = getCachedMeta(mediaType, directKey);
+    if (memDirect) {
+      return requestedMetaId ? { ...memDirect, id: requestedMetaId } : memDirect;
+    }
+    if (!options.skipEdgeRead) {
+      const edgeDirect = await readEdgeCache(`/meta-v3/${mediaType}/${directKey}`, ctx);
+      if (edgeDirect) {
+        syncCacheAliases(mediaType, tmdbEndpointType, edgeDirect);
+        return requestedMetaId ? { ...edgeDirect, id: requestedMetaId } : edgeDirect;
+      }
+    }
+  }
+
+  const tmdbId = directTmdbId || (await resolveTmdbId(id, mediaType, apiKey, ctx));
   if (!tmdbId) return null;
 
-  const requestedMetaId = /^(tmdb:|tt)/i.test(id) ? id : null;
-  const memCached = getCachedMeta(mediaType, tmdbId);
-  if (memCached) {
-    return requestedMetaId ? { ...memCached, id: requestedMetaId } : memCached;
-  }
-
-  const edgeCached = await readEdgeCache(`/meta/${mediaType}/${tmdbId}`);
-  if (edgeCached) {
-    setCachedMeta(mediaType, tmdbId, edgeCached);
-    if (edgeCached.imdb_id) {
-      rememberIdMapping(tmdbEndpointType, tmdbId, edgeCached.imdb_id);
+  if (directKey !== tmdbId) {
+    const memByTmdb = getCachedMeta(mediaType, tmdbId);
+    if (memByTmdb) {
+      if (directKey) setCachedMeta(mediaType, directKey, memByTmdb);
+      return requestedMetaId ? { ...memByTmdb, id: requestedMetaId } : memByTmdb;
     }
-    return requestedMetaId ? { ...edgeCached, id: requestedMetaId } : edgeCached;
+    if (!options.skipEdgeRead) {
+      const edgeByTmdb = await readEdgeCache(`/meta-v3/${mediaType}/${tmdbId}`, ctx);
+      if (edgeByTmdb) {
+        syncCacheAliases(mediaType, tmdbEndpointType, edgeByTmdb);
+        return requestedMetaId ? { ...edgeByTmdb, id: requestedMetaId } : edgeByTmdb;
+      }
+    }
   }
 
-  const appendFields =
-    mediaType === 'series'
-      ? 'external_ids,credits,videos,images,translations,season/1,season/2,season/3,season/4,season/5'
-      : 'external_ids,credits,videos,images,translations';
+  const seed = getSeed(mediaType, tmdbId);
+  const knownImdbId =
+    (/^tt\d+/i.test(id) ? id.split(':')[0] : null) ||
+    seed?.imdb_id ||
+    getImdbFromMemory(tmdbEndpointType, tmdbId) ||
+    null;
+  const hasViDescription = Boolean(seed?.description && seed.description.trim());
+
+  const appendParts = ['credits', 'videos', 'images'];
+  if (!knownImdbId) {
+    appendParts.unshift('external_ids');
+  }
+  if (!hasViDescription) {
+    appendParts.push('translations');
+  }
+  if (mediaType === 'series') {
+    appendParts.push('season/1', 'season/2', 'season/3');
+  }
+  const appendFields = appendParts.join(',');
 
   const viData = await tmdbFetch(
     `/${tmdbEndpointType}/${tmdbId}`,
@@ -597,7 +856,7 @@ async function getMeta(type, id, apiKey, ctx = null) {
 
   const imdbId =
     viData.external_ids?.imdb_id ||
-    (/^tt\d+/i.test(id) ? id.split(':')[0] : null) ||
+    knownImdbId ||
     undefined;
   if (imdbId) {
     rememberIdMapping(tmdbEndpointType, tmdbId, imdbId);
@@ -610,6 +869,7 @@ async function getMeta(type, id, apiKey, ctx = null) {
     viTrans?.name ||
     enTrans?.title ||
     enTrans?.name ||
+    seed?.name ||
     viData.original_title ||
     viData.original_name ||
     `TMDB #${tmdbId}`;
@@ -618,6 +878,7 @@ async function getMeta(type, id, apiKey, ctx = null) {
     (viData.overview && viData.overview.trim()) ||
     (viTrans?.overview && viTrans.overview.trim()) ||
     (enTrans?.overview && enTrans.overview.trim()) ||
+    (seed?.description && seed.description.trim()) ||
     '';
 
   const rawDate = viData.release_date || viData.first_air_date || '';
@@ -711,7 +972,17 @@ async function getMeta(type, id, apiKey, ctx = null) {
   if (mediaType === 'series') {
     const seasons = (Array.isArray(viData.seasons) ? viData.seasons : [])
       .filter((s) => Number(s.season_number) > 0)
-      .slice(0, 15);
+      .slice(0, 8);
+
+    const extraSeasonsNeeded = seasons.filter((s) => {
+      const embedded = viData[`season/${s.season_number}`];
+      if (embedded && Array.isArray(embedded.episodes)) return false;
+      return !getCache(`/tv/${tmdbId}/season/${s.season_number}?language=vi-VN`);
+    }).length;
+
+    if (options.isPrewarm && ctx && typeof ctx.canSpend === 'function' && !ctx.canSpend(extraSeasonsNeeded + 1)) {
+      return null;
+    }
 
     const seasonResults = await Promise.all(
       seasons.map((s) => {
@@ -764,9 +1035,39 @@ async function getMeta(type, id, apiKey, ctx = null) {
     };
   }
 
-  setCachedMeta(mediaType, tmdbId, meta);
-  writeEdgeCache(`/meta/${mediaType}/${tmdbId}`, meta, 21600, ctx);
-  return meta;
+  syncCacheAliases(mediaType, tmdbEndpointType, meta);
+  const storedBase = { ...meta, id: imdbId || `tmdb:${tmdbId}` };
+  if (imdbId) {
+    writeEdgeCache(`/meta-v3/${mediaType}/${imdbId.toLowerCase()}`, { ...storedBase, id: imdbId }, 21600, ctx);
+    if (!options.isPrewarm) {
+      writeEdgeCache(`/meta-v3/${mediaType}/${tmdbId}`, storedBase, 21600, ctx);
+    }
+  } else {
+    writeEdgeCache(`/meta-v3/${mediaType}/${tmdbId}`, storedBase, 21600, ctx);
+  }
+  return requestedMetaId ? { ...meta, id: requestedMetaId } : meta;
+}
+
+async function prewarmMetas(items, apiKey, reqCtx) {
+  if (!Array.isArray(items) || items.length === 0) return;
+  const isSeriesBatch = items[0]?.type === 'series';
+  const chunkSize = isSeriesBatch ? 1 : 4;
+
+  for (let i = 0; i < items.length; i += chunkSize) {
+    if (!reqCtx.canSpend(2)) break;
+    const maxAffordable = Math.min(chunkSize, Math.floor(reqCtx.remaining() / 2));
+    if (maxAffordable <= 0) break;
+
+    const slice = items.slice(i, i + maxAffordable);
+    await Promise.allSettled(
+      slice.map((m) =>
+        getMeta(m.type, m.id, apiKey, reqCtx, {
+          isPrewarm: true,
+          skipEdgeRead: true
+        }).catch(() => null)
+      )
+    );
+  }
 }
 
 function renderLandingHtml(origin) {
@@ -918,35 +1219,63 @@ export default {
         /^\/catalog\/([^/]+)\/([^/.]+?)(?:\/([^/]+?))?(?:\.json)?$/
       );
       if (catalogMatch) {
+        const reqCtx = createRunContext(ctx, 46);
+        const cache = typeof caches !== 'undefined' ? caches.default : null;
+        const routeCacheReq = cache ? new Request(url.toString(), { method: 'GET' }) : null;
+        if (cache && routeCacheReq) {
+          try {
+            reqCtx.spend(1);
+            const cachedRes = await cache.match(routeCacheReq);
+            if (cachedRes) return cachedRes;
+          } catch {}
+        }
+
         const type = decodeURIComponent(catalogMatch[1]);
         const catalogId = decodeURIComponent(catalogMatch[2]);
         const extra = parseExtra(catalogMatch[3] || '');
         for (const [k, v] of url.searchParams.entries()) {
           extra[k] = v;
         }
-        const metas = await getCatalog(type, catalogId, extra, apiKey, ctx);
+        const metas = await getCatalog(type, catalogId, extra, apiKey, reqCtx);
+        const response = jsonResponse({ metas }, 200, 'public, max-age=900, s-maxage=900');
+        if (cache && routeCacheReq && reqCtx.canSpend(1)) {
+          reqCtx.spend(1);
+          reqCtx.waitUntil(cache.put(routeCacheReq, response.clone()));
+        }
         const toPrewarm = metas
           .filter((m) => m.tmdbId && !getCachedMeta(m.type, String(m.tmdbId)))
-          .slice(0, 12);
-        if (toPrewarm.length > 0 && ctx && typeof ctx.waitUntil === 'function') {
-          ctx.waitUntil(
-            Promise.allSettled(
-              toPrewarm.map((m) => getMeta(m.type, m.id, apiKey, ctx))
-            )
-          );
+          .slice(0, 8);
+        if (toPrewarm.length > 0 && reqCtx.canSpend(2)) {
+          reqCtx.waitUntil(prewarmMetas(toPrewarm, apiKey, reqCtx));
         }
-        return jsonResponse({ metas }, 200, 'public, max-age=900');
+        return response;
       }
 
       const metaMatch = pathname.match(/^\/meta\/([^/]+)\/([^/]+)\.json$/);
       if (metaMatch) {
+        const reqCtx = createRunContext(ctx, 46);
+        const cache = typeof caches !== 'undefined' ? caches.default : null;
+        const routeCacheReq = cache ? new Request(url.toString(), { method: 'GET' }) : null;
+        if (cache && routeCacheReq) {
+          try {
+            reqCtx.spend(1);
+            const cachedRes = await cache.match(routeCacheReq);
+            if (cachedRes) return cachedRes;
+          } catch {}
+        }
+
         const type = decodeURIComponent(metaMatch[1]);
         const id = decodeURIComponent(metaMatch[2]);
-        const meta = await getMeta(type, id, apiKey, ctx);
+        const meta = await getMeta(type, id, apiKey, reqCtx);
         if (!meta) {
           return jsonResponse({ meta: null }, 404, 'no-cache');
         }
-        return jsonResponse({ meta }, 200, 'public, max-age=1800');
+        const response = jsonResponse({ meta }, 200, 'public, max-age=1800, s-maxage=1800');
+        if (cache && routeCacheReq && reqCtx.canSpend(1)) {
+          reqCtx.spend(1);
+          reqCtx.waitUntil(cache.put(routeCacheReq, response.clone()));
+        }
+        return response;
       }
 
       return jsonResponse({ error: 'Not Found' }, 404, 'no-cache');

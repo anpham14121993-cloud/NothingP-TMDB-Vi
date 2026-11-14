@@ -1,6 +1,6 @@
 {
   "name": "nothingp-tmdb-vi-addon",
-  "version": "1.0.0",
+  "version": "1.3.0",
   "description": "Stremio & Nuvio Addon Catalog + Meta nguồn TMDB Tiếng Việt (vi-VN) chạy trên Cloudflare Workers",
   "main": "worker.js",
   "type": "module",
