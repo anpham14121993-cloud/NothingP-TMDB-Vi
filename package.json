@@ -1,0 +1,23 @@
+{
+  "name": "nothingp-tmdb-vi-addon",
+  "version": "1.0.0",
+  "description": "Stremio & Nuvio Addon Catalog + Meta nguồn TMDB Tiếng Việt (vi-VN) chạy trên Cloudflare Workers",
+  "main": "worker.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "keywords": [
+    "stremio",
+    "nuvio",
+    "tmdb",
+    "vietnamese",
+    "catalog",
+    "cloudflare-workers"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}
