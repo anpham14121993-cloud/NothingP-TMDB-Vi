@@ -94,7 +94,7 @@ const MOVIE_GENRE_NAME_TO_ID = Object.fromEntries(
 
 const MANIFEST = {
   id: 'community.nothingp.tmdb.vi',
-  version: '1.3.0',
+  version: '1.4.0',
   name: 'NothingP • TMDB Tiếng Việt',
   description:
     'Danh mục & Metadata phim từ TMDB với ngôn ngữ Tiếng Việt (vi-VN) cho Stremio & Nuvio: Phim Mới Có Bản Phát Hành (Digital Release), Trending Today Phim Lẻ, Trending Today Phim Bộ.',
@@ -477,7 +477,7 @@ async function tmdbFetch(path, params = {}, primaryKey = DEFAULT_PRIMARY_KEY, ct
         const res = await fetch(url, {
           headers: {
             Accept: 'application/json',
-            'User-Agent': 'NothingP-TMDB-Vi/1.3'
+            'User-Agent': 'NothingP-TMDB-Vi/1.4'
           },
           cf: {
             cacheTtl: 3600,
@@ -776,6 +776,34 @@ function syncCacheAliases(mediaType, tmdbEndpointType, meta) {
   }
 }
 
+function buildPersonExtra(person, includeCharacter = false) {
+  if (!person?.name) return null;
+  const entry = { name: person.name };
+  if (includeCharacter && person.character && String(person.character).trim()) {
+    entry.character = String(person.character).trim();
+  }
+  if (person.profile_path) {
+    entry.photo = `${TMDB_IMG_BASE}/w300${person.profile_path}`;
+  }
+  if (person.id) {
+    entry.tmdbId = person.id;
+  }
+  return entry;
+}
+
+function dedupePeopleByName(entries) {
+  const seen = new Set();
+  const out = [];
+  for (const entry of entries) {
+    if (!entry?.name) continue;
+    const key = entry.name.trim().toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(entry);
+  }
+  return out;
+}
+
 async function getMeta(type, id, apiKey, ctx = null, options = {}) {
   const mediaType = normalizeStremioType(type);
   const tmdbEndpointType = mediaType === 'series' ? 'tv' : 'movie';
@@ -788,7 +816,7 @@ async function getMeta(type, id, apiKey, ctx = null, options = {}) {
       return requestedMetaId ? { ...memDirect, id: requestedMetaId } : memDirect;
     }
     if (!options.skipEdgeRead) {
-      const edgeDirect = await readEdgeCache(`/meta-v3/${mediaType}/${directKey}`, ctx);
+      const edgeDirect = await readEdgeCache(`/meta-v4/${mediaType}/${directKey}`, ctx);
       if (edgeDirect) {
         syncCacheAliases(mediaType, tmdbEndpointType, edgeDirect);
         return requestedMetaId ? { ...edgeDirect, id: requestedMetaId } : edgeDirect;
@@ -806,7 +834,7 @@ async function getMeta(type, id, apiKey, ctx = null, options = {}) {
       return requestedMetaId ? { ...memByTmdb, id: requestedMetaId } : memByTmdb;
     }
     if (!options.skipEdgeRead) {
-      const edgeByTmdb = await readEdgeCache(`/meta-v3/${mediaType}/${tmdbId}`, ctx);
+      const edgeByTmdb = await readEdgeCache(`/meta-v4/${mediaType}/${tmdbId}`, ctx);
       if (edgeByTmdb) {
         syncCacheAliases(mediaType, tmdbEndpointType, edgeByTmdb);
         return requestedMetaId ? { ...edgeByTmdb, id: requestedMetaId } : edgeByTmdb;
@@ -899,26 +927,29 @@ async function getMeta(type, id, apiKey, ctx = null, options = {}) {
     : [];
 
   const crew = Array.isArray(viData.credits?.crew) ? viData.credits.crew : [];
-  const castList = Array.isArray(viData.credits?.cast)
-    ? viData.credits.cast.slice(0, 10).map((c) => c.name).filter(Boolean)
-    : [];
+  const rawCast = Array.isArray(viData.credits?.cast) ? viData.credits.cast.slice(0, 20) : [];
+  const extraCast = rawCast.map((c) => buildPersonExtra(c, true)).filter(Boolean);
+  const castList = extraCast.slice(0, 10).map((c) => c.name);
 
-  let directors = crew
-    .filter((c) => c.job === 'Director')
-    .map((c) => c.name)
-    .filter(Boolean);
-  if (directors.length === 0 && Array.isArray(viData.created_by)) {
-    directors = viData.created_by.map((c) => c.name).filter(Boolean);
-  }
+  const rawDirectorCrew = crew.filter((c) => c.job === 'Director');
+  const directorSources =
+    rawDirectorCrew.length > 0
+      ? rawDirectorCrew
+      : Array.isArray(viData.created_by)
+        ? viData.created_by
+        : [];
+  const extraDirectors = dedupePeopleByName(
+    directorSources.map((c) => buildPersonExtra(c, false)).filter(Boolean)
+  );
+  const directors = extraDirectors.map((c) => c.name);
 
-  const writers = [
-    ...new Set(
-      crew
-        .filter((c) => ['Writer', 'Screenplay', 'Story'].includes(c.job))
-        .map((c) => c.name)
-        .filter(Boolean)
-    )
-  ];
+  const extraWriters = dedupePeopleByName(
+    crew
+      .filter((c) => ['Writer', 'Screenplay', 'Story'].includes(c.job))
+      .map((c) => buildPersonExtra(c, false))
+      .filter(Boolean)
+  );
+  const writers = extraWriters.map((c) => c.name);
 
   const trailers = Array.isArray(viData.videos?.results)
     ? viData.videos.results
@@ -969,10 +1000,27 @@ async function getMeta(type, id, apiKey, ctx = null, options = {}) {
   if (viData.original_language) meta.language = viData.original_language;
   if (viData.homepage) meta.website = viData.homepage;
 
+  const appExtras = {
+    cast: extraCast,
+    directors: extraDirectors,
+    writers: extraWriters
+  };
+  meta.app_extras = appExtras;
+
   if (mediaType === 'series') {
     const seasons = (Array.isArray(viData.seasons) ? viData.seasons : [])
       .filter((s) => Number(s.season_number) > 0)
       .slice(0, 8);
+
+    const seasonPosters = {};
+    for (const s of seasons) {
+      if (s?.season_number != null && s.poster_path) {
+        seasonPosters[String(s.season_number)] = `${TMDB_IMG_BASE}/w500${s.poster_path}`;
+      }
+    }
+    if (Object.keys(seasonPosters).length > 0) {
+      appExtras.seasonPosters = seasonPosters;
+    }
 
     const extraSeasonsNeeded = seasons.filter((s) => {
       const embedded = viData[`season/${s.season_number}`];
@@ -1017,6 +1065,18 @@ async function getMeta(type, id, apiKey, ctx = null, options = {}) {
         if (ep.still_path) {
           video.thumbnail = `${TMDB_IMG_BASE}/w500${ep.still_path}`;
         }
+        const epSeasonPoster =
+          seasonPosters[String(ep.season_number)] ||
+          (seasonData.poster_path ? `${TMDB_IMG_BASE}/w500${seasonData.poster_path}` : undefined);
+        if (epSeasonPoster) {
+          video.seasonPoster = epSeasonPoster;
+        }
+        if (ep.runtime > 0) {
+          video.runtime = `${ep.runtime} min`;
+        }
+        if (ep.vote_average > 0) {
+          video.rating = Number(ep.vote_average).toFixed(1);
+        }
         const epReleased = toIsoDate(ep.air_date);
         if (epReleased) {
           video.released = epReleased;
@@ -1038,12 +1098,12 @@ async function getMeta(type, id, apiKey, ctx = null, options = {}) {
   syncCacheAliases(mediaType, tmdbEndpointType, meta);
   const storedBase = { ...meta, id: imdbId || `tmdb:${tmdbId}` };
   if (imdbId) {
-    writeEdgeCache(`/meta-v3/${mediaType}/${imdbId.toLowerCase()}`, { ...storedBase, id: imdbId }, 21600, ctx);
+    writeEdgeCache(`/meta-v4/${mediaType}/${imdbId.toLowerCase()}`, { ...storedBase, id: imdbId }, 21600, ctx);
     if (!options.isPrewarm) {
-      writeEdgeCache(`/meta-v3/${mediaType}/${tmdbId}`, storedBase, 21600, ctx);
+      writeEdgeCache(`/meta-v4/${mediaType}/${tmdbId}`, storedBase, 21600, ctx);
     }
   } else {
-    writeEdgeCache(`/meta-v3/${mediaType}/${tmdbId}`, storedBase, 21600, ctx);
+    writeEdgeCache(`/meta-v4/${mediaType}/${tmdbId}`, storedBase, 21600, ctx);
   }
   return requestedMetaId ? { ...meta, id: requestedMetaId } : meta;
 }
@@ -1221,7 +1281,7 @@ export default {
       if (catalogMatch) {
         const reqCtx = createRunContext(ctx, 46);
         const cache = typeof caches !== 'undefined' ? caches.default : null;
-        const routeCacheReq = cache ? new Request(url.toString(), { method: 'GET' }) : null;
+        const routeCacheReq = cache ? buildEdgeCacheRequest(`/route-v4${url.pathname}${url.search}`) : null;
         if (cache && routeCacheReq) {
           try {
             reqCtx.spend(1);
@@ -1255,7 +1315,7 @@ export default {
       if (metaMatch) {
         const reqCtx = createRunContext(ctx, 46);
         const cache = typeof caches !== 'undefined' ? caches.default : null;
-        const routeCacheReq = cache ? new Request(url.toString(), { method: 'GET' }) : null;
+        const routeCacheReq = cache ? buildEdgeCacheRequest(`/route-v4${url.pathname}${url.search}`) : null;
         if (cache && routeCacheReq) {
           try {
             reqCtx.spend(1);
