@@ -1,8 +1,8 @@
 const DEFAULT_PRIMARY_KEY = 'b97222227e0440713868b5d5b71898b0';
 const DEFAULT_FALLBACK_KEY = 'c8af09ffecd8ade9a74ba402c4d27485';
 const TMDB_API_BASES = [
-  'https://api.tmdb.org/3',
-  'https://api.themoviedb.org/3'
+  'https://api.themoviedb.org/3',
+  'https://api.tmdb.org/3'
 ];
 const TMDB_IMG_BASE = 'https://image.tmdb.org/t/p';
 
@@ -14,6 +14,11 @@ const IMDB_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const IMDB_NULL_CACHE_TTL_MS = 30 * 60 * 1000;
 const MAX_IMDB_CACHE_SIZE = 2000;
 const imdbCache = new Map();
+const imdbToTmdbCache = new Map();
+
+const META_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const MAX_META_CACHE_SIZE = 500;
+const metaCache = new Map();
 
 const MOVIE_GENRES = {
   28: 'Hành Động',
@@ -83,7 +88,7 @@ const MOVIE_GENRE_NAME_TO_ID = Object.fromEntries(
 
 const MANIFEST = {
   id: 'community.nothingp.tmdb.vi',
-  version: '1.1.0',
+  version: '1.2.0',
   name: 'NothingP • TMDB Tiếng Việt',
   description:
     'Danh mục & Metadata phim từ TMDB với ngôn ngữ Tiếng Việt (vi-VN) cho Stremio & Nuvio: Phim Mới Có Bản Phát Hành (Digital Release), Trending Today Phim Lẻ, Trending Today Phim Bộ.',
@@ -194,7 +199,78 @@ function buildKeyCandidates(primaryKey) {
   return keys;
 }
 
-async function tmdbFetch(path, params = {}, primaryKey = DEFAULT_PRIMARY_KEY) {
+async function readEdgeCache(cachePath) {
+  try {
+    const cache = typeof caches !== 'undefined' ? caches.default : null;
+    if (!cache) return null;
+    const hit = await cache.match(`https://tmdb-vi-cache.internal${cachePath}`);
+    if (!hit) return null;
+    return await hit.json();
+  } catch {
+    return null;
+  }
+}
+
+function writeEdgeCache(cachePath, data, maxAgeSec, ctx) {
+  try {
+    const cache = typeof caches !== 'undefined' ? caches.default : null;
+    if (!cache) return;
+    const res = new Response(JSON.stringify(data), {
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': `public, max-age=${maxAgeSec}`
+      }
+    });
+    const promise = cache
+      .put(`https://tmdb-vi-cache.internal${cachePath}`, res)
+      .catch(() => {});
+    if (ctx && typeof ctx.waitUntil === 'function') {
+      ctx.waitUntil(promise);
+    }
+  } catch {
+    // ignore edge cache errors
+  }
+}
+
+function rememberIdMapping(mediaType, tmdbId, imdbId) {
+  if (!tmdbId || !imdbId) return;
+  const cleanImdb = String(imdbId).trim().toLowerCase();
+  const cleanTmdb = String(tmdbId).trim();
+  if (!/^tt\d+$/i.test(cleanImdb) || !/^\d+$/.test(cleanTmdb)) return;
+
+  for (const key of [`${mediaType}:${cleanImdb}`, cleanImdb]) {
+    if (imdbToTmdbCache.size >= MAX_IMDB_CACHE_SIZE) {
+      const oldestKey = imdbToTmdbCache.keys().next().value;
+      if (oldestKey !== undefined) imdbToTmdbCache.delete(oldestKey);
+    }
+    imdbToTmdbCache.set(key, cleanTmdb);
+  }
+}
+
+function getCachedMeta(mediaType, tmdbId) {
+  const key = `${mediaType}:${tmdbId}`;
+  const entry = metaCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    metaCache.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function setCachedMeta(mediaType, tmdbId, meta) {
+  const key = `${mediaType}:${tmdbId}`;
+  if (metaCache.size >= MAX_META_CACHE_SIZE) {
+    const oldestKey = metaCache.keys().next().value;
+    if (oldestKey !== undefined) metaCache.delete(oldestKey);
+  }
+  metaCache.set(key, {
+    value: meta,
+    expiresAt: Date.now() + META_CACHE_TTL_MS
+  });
+}
+
+async function tmdbFetch(path, params = {}, primaryKey = DEFAULT_PRIMARY_KEY, ctx = null) {
   const cleanPath = path.startsWith('/') ? path : `/${path}`;
   const queryEntries = Object.entries(params).filter(
     ([, v]) => v !== undefined && v !== null && String(v) !== ''
@@ -205,6 +281,12 @@ async function tmdbFetch(path, params = {}, primaryKey = DEFAULT_PRIMARY_KEY) {
   const cacheKey = `${cleanPath}?${queryStr}`;
   const cached = getCache(cacheKey);
   if (cached) return cached;
+
+  const edgeCached = await readEdgeCache(`/tmdb${cacheKey}`);
+  if (edgeCached) {
+    setCache(cacheKey, edgeCached);
+    return edgeCached;
+  }
 
   const keys = buildKeyCandidates(primaryKey);
   let lastError = null;
@@ -217,16 +299,17 @@ async function tmdbFetch(path, params = {}, primaryKey = DEFAULT_PRIMARY_KEY) {
         const res = await fetch(url, {
           headers: {
             Accept: 'application/json',
-            'User-Agent': 'NothingP-TMDB-Vi/1.0'
+            'User-Agent': 'NothingP-TMDB-Vi/1.2'
           },
           cf: {
-            cacheTtl: 1800,
+            cacheTtl: 3600,
             cacheEverything: true
           }
         });
         if (res.ok) {
           const data = await res.json();
           setCache(cacheKey, data);
+          writeEdgeCache(`/tmdb${cacheKey}`, data, 3600, ctx);
           return data;
         }
         lastError = new Error(`TMDB HTTP ${res.status} on ${base}${cleanPath}`);
@@ -257,11 +340,12 @@ function mapGenres(genreIds, type) {
   return genreIds.map((id) => table[id]).filter(Boolean);
 }
 
-async function resolveImdbIdForTmdb(tmdbId, type, apiKey) {
+async function resolveImdbIdForTmdb(tmdbId, type, apiKey, ctx = null) {
   const mediaType = type === 'series' ? 'tv' : 'movie';
   const cacheKey = `${mediaType}:${tmdbId}`;
   const cached = imdbCache.get(cacheKey);
   if (cached && Date.now() <= cached.expiresAt) {
+    if (cached.value) rememberIdMapping(mediaType, tmdbId, cached.value);
     return cached.value;
   }
   if (cached) {
@@ -269,7 +353,7 @@ async function resolveImdbIdForTmdb(tmdbId, type, apiKey) {
   }
 
   try {
-    const data = await tmdbFetch(`/${mediaType}/${tmdbId}/external_ids`, {}, apiKey);
+    const data = await tmdbFetch(`/${mediaType}/${tmdbId}/external_ids`, {}, apiKey, ctx);
     const imdbId =
       typeof data?.imdb_id === 'string' && /^tt\d+$/i.test(data.imdb_id.trim())
         ? data.imdb_id.trim()
@@ -285,6 +369,9 @@ async function resolveImdbIdForTmdb(tmdbId, type, apiKey) {
       value: imdbId,
       expiresAt: Date.now() + (imdbId ? IMDB_CACHE_TTL_MS : IMDB_NULL_CACHE_TTL_MS)
     });
+    if (imdbId) {
+      rememberIdMapping(mediaType, tmdbId, imdbId);
+    }
     return imdbId;
   } catch {
     return null;
@@ -342,7 +429,7 @@ function parseExtra(extraStr) {
   return extra;
 }
 
-async function getCatalog(type, catalogId, extra, apiKey) {
+async function getCatalog(type, catalogId, extra, apiKey, ctx = null) {
   const skip = Math.max(0, parseInt(extra.skip, 10) || 0);
   const page = Math.floor(skip / 20) + 1;
   const search = typeof extra.search === 'string' ? extra.search.trim() : '';
@@ -359,7 +446,8 @@ async function getCatalog(type, catalogId, extra, apiKey) {
         include_adult: 'false',
         page
       },
-      apiKey
+      apiKey,
+      ctx
     );
   } else if (catalogId === 'tmdb_digital_release' && type === 'movie') {
     const now = new Date();
@@ -383,18 +471,20 @@ async function getCatalog(type, catalogId, extra, apiKey) {
       params.with_genres = String(MOVIE_GENRE_NAME_TO_ID[extra.genre]);
     }
 
-    data = await tmdbFetch('/discover/movie', params, apiKey);
+    data = await tmdbFetch('/discover/movie', params, apiKey, ctx);
   } else if (catalogId === 'tmdb_trending_movie_day' && type === 'movie') {
     data = await tmdbFetch(
       '/trending/movie/day',
       { language: 'vi-VN', page },
-      apiKey
+      apiKey,
+      ctx
     );
   } else if (catalogId === 'tmdb_trending_tv_day' && type === 'series') {
     data = await tmdbFetch(
       '/trending/tv/day',
       { language: 'vi-VN', page },
-      apiKey
+      apiKey,
+      ctx
     );
   } else {
     return [];
@@ -402,7 +492,7 @@ async function getCatalog(type, catalogId, extra, apiKey) {
 
   const results = Array.isArray(data?.results) ? data.results : [];
   const imdbIds = await Promise.all(
-    results.map((item) => resolveImdbIdForTmdb(item.id, type, apiKey))
+    results.map((item) => resolveImdbIdForTmdb(item.id, type, apiKey, ctx))
   );
   return results.map((item, idx) => mapCatalogItem(item, type, imdbIds[idx]));
 }
@@ -415,7 +505,7 @@ function selectClearLogo(logos) {
   return chosen?.file_path ? `${TMDB_IMG_BASE}/w500${chosen.file_path}` : undefined;
 }
 
-async function resolveTmdbId(rawId, type, apiKey) {
+async function resolveTmdbId(rawId, type, apiKey, ctx = null) {
   const cleaned = String(rawId || '').trim();
   if (!cleaned) return null;
 
@@ -427,66 +517,107 @@ async function resolveTmdbId(rawId, type, apiKey) {
     return cleaned;
   }
   if (/^tt\d+/i.test(cleaned)) {
-    const imdbId = cleaned.split(':')[0];
+    const imdbId = cleaned.split(':')[0].toLowerCase();
+    const mediaEndpointType = type === 'series' ? 'tv' : 'movie';
+    const mapped =
+      imdbToTmdbCache.get(`${mediaEndpointType}:${imdbId}`) ||
+      imdbToTmdbCache.get(imdbId);
+    if (mapped) return mapped;
+
     const found = await tmdbFetch(
       `/find/${encodeURIComponent(imdbId)}`,
       { external_source: 'imdb_id' },
-      apiKey
+      apiKey,
+      ctx
     );
     if (!found) return null;
     if (type === 'series') {
       const tvId = found.tv_results?.[0]?.id || found.movie_results?.[0]?.id;
-      return tvId ? String(tvId) : null;
+      if (tvId) {
+        rememberIdMapping('tv', String(tvId), imdbId);
+        return String(tvId);
+      }
+      return null;
     }
     const movieId = found.movie_results?.[0]?.id || found.tv_results?.[0]?.id;
-    return movieId ? String(movieId) : null;
+    if (movieId) {
+      rememberIdMapping('movie', String(movieId), imdbId);
+      return String(movieId);
+    }
+    return null;
   }
   return null;
 }
 
-async function getMeta(type, id, apiKey) {
+async function getMeta(type, id, apiKey, ctx = null) {
   const mediaType = type === 'series' ? 'series' : 'movie';
   const tmdbEndpointType = mediaType === 'series' ? 'tv' : 'movie';
-  const tmdbId = await resolveTmdbId(id, mediaType, apiKey);
+  const tmdbId = await resolveTmdbId(id, mediaType, apiKey, ctx);
   if (!tmdbId) return null;
+
+  const requestedMetaId = /^(tmdb:|tt)/i.test(id) ? id : null;
+  const memCached = getCachedMeta(mediaType, tmdbId);
+  if (memCached) {
+    return requestedMetaId ? { ...memCached, id: requestedMetaId } : memCached;
+  }
+
+  const edgeCached = await readEdgeCache(`/meta/${mediaType}/${tmdbId}`);
+  if (edgeCached) {
+    setCachedMeta(mediaType, tmdbId, edgeCached);
+    if (edgeCached.imdb_id) {
+      rememberIdMapping(tmdbEndpointType, tmdbId, edgeCached.imdb_id);
+    }
+    return requestedMetaId ? { ...edgeCached, id: requestedMetaId } : edgeCached;
+  }
+
+  const appendFields =
+    mediaType === 'series'
+      ? 'external_ids,credits,videos,images,translations,season/1,season/2,season/3,season/4,season/5'
+      : 'external_ids,credits,videos,images,translations';
 
   const viData = await tmdbFetch(
     `/${tmdbEndpointType}/${tmdbId}`,
     {
       language: 'vi-VN',
-      append_to_response: 'external_ids,credits,videos,images',
+      append_to_response: appendFields,
       include_image_language: 'vi,en,null'
     },
-    apiKey
+    apiKey,
+    ctx
   );
   if (!viData) return null;
 
-  let enFallback = null;
-  if (!viData.overview || !(viData.title || viData.name)) {
-    enFallback = await tmdbFetch(
-      `/${tmdbEndpointType}/${tmdbId}`,
-      { language: 'en-US' },
-      apiKey
-    ).catch(() => null);
-  }
+  const translations = Array.isArray(viData.translations?.translations)
+    ? viData.translations.translations
+    : [];
+  const viTrans = translations.find((t) => t.iso_639_1 === 'vi')?.data;
+  const enTrans =
+    translations.find((t) => t.iso_639_1 === 'en' && t.iso_3166_1 === 'US')?.data ||
+    translations.find((t) => t.iso_639_1 === 'en')?.data;
 
   const imdbId =
     viData.external_ids?.imdb_id ||
     (/^tt\d+/i.test(id) ? id.split(':')[0] : null) ||
     undefined;
+  if (imdbId) {
+    rememberIdMapping(tmdbEndpointType, tmdbId, imdbId);
+  }
 
   const title =
     viData.title ||
     viData.name ||
-    enFallback?.title ||
-    enFallback?.name ||
+    viTrans?.title ||
+    viTrans?.name ||
+    enTrans?.title ||
+    enTrans?.name ||
     viData.original_title ||
     viData.original_name ||
     `TMDB #${tmdbId}`;
 
   const description =
     (viData.overview && viData.overview.trim()) ||
-    (enFallback?.overview && enFallback.overview.trim()) ||
+    (viTrans?.overview && viTrans.overview.trim()) ||
+    (enTrans?.overview && enTrans.overview.trim()) ||
     '';
 
   const rawDate = viData.release_date || viData.first_air_date || '';
@@ -538,9 +669,7 @@ async function getMeta(type, id, apiKey) {
     viData.runtime ||
     (Array.isArray(viData.episode_run_time) ? viData.episode_run_time[0] : null);
 
-  const metaId = /^(tmdb:|tt)/i.test(id)
-    ? id
-    : imdbId || `tmdb:${tmdbId}`;
+  const metaId = requestedMetaId || imdbId || `tmdb:${tmdbId}`;
 
   const meta = {
     id: metaId,
@@ -585,13 +714,18 @@ async function getMeta(type, id, apiKey) {
       .slice(0, 15);
 
     const seasonResults = await Promise.all(
-      seasons.map((s) =>
-        tmdbFetch(
+      seasons.map((s) => {
+        const embedded = viData[`season/${s.season_number}`];
+        if (embedded && Array.isArray(embedded.episodes)) {
+          return Promise.resolve(embedded);
+        }
+        return tmdbFetch(
           `/tv/${tmdbId}/season/${s.season_number}`,
           { language: 'vi-VN' },
-          apiKey
-        ).catch(() => null)
-      )
+          apiKey,
+          ctx
+        ).catch(() => null);
+      })
     );
 
     const epPrefix = imdbId || `tmdb:${tmdbId}`;
@@ -630,6 +764,8 @@ async function getMeta(type, id, apiKey) {
     };
   }
 
+  setCachedMeta(mediaType, tmdbId, meta);
+  writeEdgeCache(`/meta/${mediaType}/${tmdbId}`, meta, 21600, ctx);
   return meta;
 }
 
@@ -749,7 +885,7 @@ function renderLandingHtml(origin) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
@@ -788,7 +924,17 @@ export default {
         for (const [k, v] of url.searchParams.entries()) {
           extra[k] = v;
         }
-        const metas = await getCatalog(type, catalogId, extra, apiKey);
+        const metas = await getCatalog(type, catalogId, extra, apiKey, ctx);
+        const toPrewarm = metas
+          .filter((m) => m.tmdbId && !getCachedMeta(m.type, String(m.tmdbId)))
+          .slice(0, 12);
+        if (toPrewarm.length > 0 && ctx && typeof ctx.waitUntil === 'function') {
+          ctx.waitUntil(
+            Promise.allSettled(
+              toPrewarm.map((m) => getMeta(m.type, m.id, apiKey, ctx))
+            )
+          );
+        }
         return jsonResponse({ metas }, 200, 'public, max-age=900');
       }
 
@@ -796,7 +942,7 @@ export default {
       if (metaMatch) {
         const type = decodeURIComponent(metaMatch[1]);
         const id = decodeURIComponent(metaMatch[2]);
-        const meta = await getMeta(type, id, apiKey);
+        const meta = await getMeta(type, id, apiKey, ctx);
         if (!meta) {
           return jsonResponse({ meta: null }, 404, 'no-cache');
         }
